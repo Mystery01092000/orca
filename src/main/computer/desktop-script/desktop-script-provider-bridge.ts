@@ -164,6 +164,9 @@ export function mapBridgeError(message: string): RuntimeClientError {
   if (/target_elevated/i.test(text)) {
     return new RuntimeClientError('permission_denied', text)
   }
+  if (text.startsWith('background_unavailable:')) {
+    return new RuntimeClientError('background_unavailable', text)
+  }
   if (/appNotFound|app not found/i.test(text)) {
     return new RuntimeClientError('app_not_found', text)
   }
