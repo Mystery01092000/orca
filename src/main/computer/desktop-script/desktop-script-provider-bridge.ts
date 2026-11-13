@@ -158,6 +158,9 @@ function runBridgeProcess(
 
 export function mapBridgeError(message: string): RuntimeClientError {
   const text = message.trim() || 'desktop provider failed'
+  if (text.startsWith('background_unavailable:')) {
+    return new RuntimeClientError('background_unavailable', text)
+  }
   if (/text_input_incomplete|window_not_responding/i.test(text)) {
     return new RuntimeClientError('action_timeout', text)
   }
