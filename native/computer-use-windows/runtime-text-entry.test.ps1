@@ -59,7 +59,8 @@ $functions = @(
     "Restore-OrcaWindow", "Assert-OrcaWindowTarget", "Get-OrcaRequiredString", "Invoke-OrcaOperation",
     "Assert-OrcaInputAllowed", "Test-OrcaTargetTookForeground", "Get-OrcaProperty", "Test-OrcaSensitiveElement",
     "Test-OrcaEditClass", "Get-OrcaNativeEdit", "Assert-OrcaEditOwner", "ConvertTo-OrcaEditNewlines",
-    "Invoke-OrcaEditTextInsertion", "Invoke-OrcaElementTextInsertion", "Send-OrcaText"
+    "Invoke-OrcaEditTextInsertion", "Invoke-OrcaElementTextInsertion", "Send-OrcaText",
+    "Test-OrcaElementDisabled", "Assert-OrcaStillFocused"
 )
 foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
     if ($definition.Name -in $functions) { . ([scriptblock]::Create($definition.Extent.Text)) }
@@ -77,9 +78,12 @@ function Send-OrcaHotkey { [OrcaDesktopWin32]::Calls.Add("sendkeys") }
 function Send-OrcaPasteText { [OrcaDesktopWin32]::Calls.Add("sendkeys") }
 function New-OrcaSnapshot { [pscustomobject]@{} }
 
-function New-TestElement([string]$ClassName, [int64]$Handle) {
+function New-TestElement([string]$ClassName, [int64]$Handle, [bool]$Enabled = $true) {
     $live = [pscustomobject]@{
-        Current = [pscustomobject]@{ ClassName = $ClassName; NativeWindowHandle = $Handle; IsPassword = $false; Name = "Body"; AutomationId = ""; LocalizedControlType = "document" }
+        Current = [pscustomobject]@{
+            ClassName = $ClassName; NativeWindowHandle = $Handle; IsPassword = $false; IsEnabled = $Enabled; Name = "Body"
+            AutomationId = ""; LocalizedControlType = "document"; ControlType = [pscustomobject]@{ ProgrammaticName = "ControlType.Document" }
+        }
     }
     [pscustomobject]@{ index = 7; live = $live }
 }
@@ -122,6 +126,18 @@ Assert-TestEqual $outcome.result.action.verification.state "verified" "edit inse
 [OrcaDesktopWin32]::IgnoreInsertion = $true
 $outcome = Invoke-TestOperation ([pscustomobject]@{ tool = "type_text"; app = "Fixture"; text = "x"; element = (New-TestElement "Edit" 303) })
 if ($outcome.message -notlike "text_insertion_unconfirmed:*") { throw "ignored insertion, received '$($outcome.message)'" }
+
+# Replacing a selection with the same text changes nothing yet is the requested result.
+[OrcaDesktopWin32]::Reset("abc", 0, 3)
+$outcome = Invoke-TestOperation ([pscustomobject]@{ tool = "type_text"; app = "Fixture"; text = "abc"; element = (New-TestElement "Edit" 303) })
+if ($null -ne $outcome.message) { throw "identical replacement failed: $($outcome.message)" }
+Assert-TestEqual $outcome.result.action.verification.state "verified" "identical replacement verification"
+
+# Edit messages would bypass a disabled field's lock, so a disabled field is refused untouched.
+[OrcaDesktopWin32]::Reset("", 0, 0)
+$outcome = Invoke-TestOperation ([pscustomobject]@{ tool = "type_text"; app = "Fixture"; text = "x"; element = (New-TestElement "Edit" 303 $false) })
+if ($outcome.message -notlike "element 7 text is not settable: the field is disabled") { throw "disabled edit, received '$($outcome.message)'" }
+Assert-TestEqual ([OrcaDesktopWin32]::Calls.Count) 0 "disabled edit sends nothing"
 
 # A recycled window handle owned by another process is never messaged.
 [OrcaDesktopWin32]::Reset("", 0, 0)

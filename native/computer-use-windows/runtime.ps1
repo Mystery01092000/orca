@@ -769,6 +769,7 @@ function ConvertTo-OrcaEditNewlines([string]$Text, [bool]$Collapse) {
 }
 
 function Invoke-OrcaEditTextInsertion($Edit, [int]$Index, [string]$Text) {
+    Assert-OrcaEditOwner $Edit
     $style = [OrcaDesktopWin32]::GetWindowLong($Edit.handle, -16)
     if (($style -band 0x0800) -ne 0) { throw "element $Index text is not settable: the field is read-only" }
     $insert = ConvertTo-OrcaEditNewlines $Text $false
@@ -782,23 +783,34 @@ function Invoke-OrcaEditTextInsertion($Edit, [int]$Index, [string]$Text) {
     $after = if ($null -eq $before) { $null } else { [OrcaDesktopWin32]::GetEditText($Edit.handle, $EditReadbackLimit) }
     # Why: a text past the read limit can't show the whole result, so it neither proves nor disproves the insertion.
     if ($null -eq $after -or $before.Length -ge $EditReadbackLimit -or $after.Length -ge $EditReadbackLimit) { return $action }
-    if ($after -ceq $before) {
-        throw "text_insertion_unconfirmed: element $Index did not change after the insertion; run get-app-state to check the field before retrying"
-    }
-    if ($null -eq $selection) { return $action }
     # Why: RichEdit counts a line break as one character in its selection but may read it back as CRLF.
     $current = if ($Edit.rich) { ConvertTo-OrcaEditNewlines $before $true } else { $before }
-    $start = [Math]::Min($selection[0], $selection[1])
-    $end = [Math]::Max($selection[0], $selection[1])
-    if ($end -gt $current.Length) { return $action }
-    $expected = $current.Substring(0, $start) + (ConvertTo-OrcaEditNewlines $Text $Edit.rich) + $current.Substring($end)
     $actual = if ($Edit.rich) { ConvertTo-OrcaEditNewlines $after $true } else { $after }
-    $action.verification = if ($actual -ceq $expected) {
-        [pscustomobject]@{ state = "verified"; property = "elementText" }
-    } else {
-        [pscustomobject]@{ state = "unverified"; reason = "text_mismatch" }
+    $expected = $null
+    if ($null -ne $selection -and [Math]::Max($selection[0], $selection[1]) -le $current.Length) {
+        $start = [Math]::Min($selection[0], $selection[1])
+        $end = [Math]::Max($selection[0], $selection[1])
+        $expected = $current.Substring(0, $start) + (ConvertTo-OrcaEditNewlines $Text $Edit.rich) + $current.Substring($end)
+    }
+    if ($null -ne $expected -and $actual -ceq $expected) {
+        $action.verification = [pscustomobject]@{ state = "verified"; property = "elementText" }
+    } elseif ($after -ceq $before) {
+        throw "text_insertion_unconfirmed: element $Index did not change after the insertion; run get-app-state to check the field before retrying"
+    } elseif ($null -ne $expected) {
+        $action.verification = [pscustomobject]@{ state = "unverified"; reason = "text_mismatch" }
     }
     $action
+}
+
+function Set-OrcaTextCaret($Element, [int]$Offset) {
+    # Why: a ValuePattern write resets WPF's caret to the start, so the next insertion would land there.
+    try {
+        $text = $Element.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+        $caret = $text.DocumentRange.Clone()
+        $caret.MoveEndpointByRange([Windows.Automation.Text.TextPatternRangeEndpoint]::End, $caret, [Windows.Automation.Text.TextPatternRangeEndpoint]::Start)
+        [void]$caret.Move([Windows.Automation.Text.TextUnit]::Character, $Offset)
+        $caret.Select()
+    } catch {}
 }
 
 function Get-OrcaTextSelectionOffsets($Element) {
@@ -817,7 +829,8 @@ function Get-OrcaTextSelectionOffsets($Element) {
 
 function Invoke-OrcaValueTextInsertion($Element, [int]$Index, [string]$Text) {
     $pattern = try { $Element.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern) } catch { $null }
-    if ($null -eq $pattern -or $pattern.Current.IsReadOnly) { return $null }
+    if ($null -eq $pattern) { return $null }
+    if ($pattern.Current.IsReadOnly) { throw "element $Index text is not settable: the field is read-only" }
     if (Test-OrcaSensitiveElement $Element) {
         throw "element $Index text is not settable at its caret: it is a password field, whose text can't be read; use set-value to replace it"
     }
@@ -834,6 +847,7 @@ function Invoke-OrcaValueTextInsertion($Element, [int]$Index, [string]$Text) {
         if ($actual -ceq $next -or $stopwatch.ElapsedMilliseconds -ge 500) { break }
         Start-Sleep -Milliseconds 25
     }
+    if ($actual -ceq $next) { Set-OrcaTextCaret $Element ($selection[0] + $Text.Length) }
     $verification = if ($actual -ceq $next) {
         [pscustomobject]@{ state = "verified"; property = "elementText" }
     } elseif ($null -eq $actual) {
@@ -851,10 +865,16 @@ function Invoke-OrcaElementTextInsertion($Element, $Record, $Process, $Operation
         throw "stale element: element $($Record.index) is gone; run get-app-state again and use a fresh element index"
     }
     $index = [int]$Record.index
+    # Why: edit messages bypass a disabled field's lock, which set-value's UI Automation write honours.
+    if (Test-OrcaElementDisabled $Element) { throw "element $index text is not settable: the field is disabled" }
     $edit = Get-OrcaNativeEdit $Element $Process
     if ($null -ne $edit) { return Invoke-OrcaEditTextInsertion $edit $index $Text }
     $action = Invoke-OrcaValueTextInsertion $Element $index $Text
     if ($null -ne $action) { return $action }
+    $controlType = try { [string]$Element.Current.ControlType.ProgrammaticName } catch { "" }
+    if ($controlType -notin @("ControlType.Edit", "ControlType.Document")) {
+        throw "element $index text is not settable: it is not a text field"
+    }
     if (-not [bool]$Operation.restoreWindow) {
         throw (Get-OrcaForegroundRefusal "element $index accepts text only as keys, which Windows delivers only to the window in front")
     }
@@ -1684,10 +1704,7 @@ function Send-OrcaDrag($From, $To) {
 }
 
 function Send-OrcaText([IntPtr]$WindowHandle, [string]$Text) {
-    # Why: SendInput types into whatever is in front, so a user switching windows since the focus check must not receive the text.
-    if (-not (Test-OrcaWindowFocused $WindowHandle)) {
-        throw "window_not_focused: the target window lost focus before typing; no text was sent"
-    }
+    Assert-OrcaStillFocused $WindowHandle
     if (-not [OrcaDesktopWin32]::SendUnicodeText($Text)) {
         throw "SendInput did not deliver the text; inspect the field before retrying"
     }
@@ -1705,7 +1722,15 @@ function Get-OrcaVirtualKey([string]$Key) {
     throw "Unsupported key: $Key"
 }
 
+function Assert-OrcaStillFocused([IntPtr]$WindowHandle) {
+    # Why: keys go to whatever is in front, so a user switching windows since the focus check must not receive them.
+    if (-not (Test-OrcaWindowFocused $WindowHandle)) {
+        throw "window_not_focused: the target window lost focus before the keys were sent; nothing was sent"
+    }
+}
+
 function Send-OrcaKey([IntPtr]$WindowHandle, [string]$Key) {
+    Assert-OrcaStillFocused $WindowHandle
     [System.Windows.Forms.SendKeys]::SendWait((ConvertTo-OrcaSendKeysKey $Key))
 }
 
@@ -1746,6 +1771,7 @@ function ConvertTo-OrcaSendKeysHotkey([string]$KeySpec) {
 
 function Send-OrcaHotkey([IntPtr]$WindowHandle, [string]$KeySpec) {
     $keys = ConvertTo-OrcaSendKeysHotkey $KeySpec
+    Assert-OrcaStillFocused $WindowHandle
     [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
 
