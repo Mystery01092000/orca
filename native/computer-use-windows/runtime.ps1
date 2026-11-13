@@ -185,6 +185,7 @@ public static class OrcaDesktopWin32 {
     public static string GetEditText(IntPtr hwnd, int maxLength) {
         IntPtr length;
         if (SendMessageTimeout(hwnd, 0x000E, IntPtr.Zero, IntPtr.Zero, AbortIfHung, EditMessageTimeoutMilliseconds, out length) == IntPtr.Zero) { return null; }
+        if (length.ToInt64() <= 0) { return ""; }
         var capacity = (int)Math.Min(Math.Max(0L, length.ToInt64()), (long)maxLength) + 1;
         var buffer = new System.Text.StringBuilder(capacity);
         IntPtr copied;
@@ -207,12 +208,15 @@ public static class OrcaDesktopWin32 {
         const uint keyUp = 0x0002;
         const uint unicode = 0x0004;
         const byte returnKey = 0x0D;
+        const byte tabKey = 0x09;
         var inputs = new List<INPUT>();
         foreach (var unit in text) {
             if (unit == '\r') { continue; }
-            if (unit == '\n') {
-                inputs.Add(KeyboardInput(keyboardInput, returnKey, 0));
-                inputs.Add(KeyboardInput(keyboardInput, returnKey, keyUp));
+            // Why: Return and Tab go as keys, as SendKeys sent them, so dialogs and forms act on them.
+            if (unit == '\n' || unit == '\t') {
+                var key = unit == '\n' ? returnKey : tabKey;
+                inputs.Add(KeyboardInput(keyboardInput, key, 0));
+                inputs.Add(KeyboardInput(keyboardInput, key, keyUp));
                 continue;
             }
             inputs.Add(UnicodeInput(unit, unicode));
@@ -729,9 +733,9 @@ function Test-OrcaEditClass([string]$ClassName) {
     $ClassName -match "^(?:WindowsForms\d+\.)?(?:Edit|RichEdit\w*)(?:\.|$)"
 }
 
-function Get-OrcaEditValueText($Element, [IntPtr]$Handle) {
+# Only for elements Get-OrcaValueText left empty, so never a sensitive one (it answers "[redacted]" for those).
+function Get-OrcaEditValueText([IntPtr]$Handle) {
     # Why: the client-side edit proxy gives a multiline edit (Notepad's document) no ValuePattern, so its text is read directly.
-    if (Test-OrcaSensitiveElement $Element) { return "[redacted]" }
     $text = [OrcaDesktopWin32]::GetEditText($Handle, $TextLimit + 1)
     if ($null -eq $text) { return "" }
     if ($text.Length -gt $TextLimit) { return $text.Substring(0, $TextLimit) + "..." }
@@ -802,13 +806,21 @@ function Invoke-OrcaEditTextInsertion($Edit, [int]$Index, [string]$Text) {
     $action
 }
 
-function Set-OrcaTextCaret($Element, [int]$Offset) {
+function Set-OrcaTextCaret($Element, [string]$Leading) {
     # Why: a ValuePattern write resets WPF's caret to the start, so the next insertion would land there.
     try {
-        $text = $Element.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
-        $caret = $text.DocumentRange.Clone()
-        $caret.MoveEndpointByRange([Windows.Automation.Text.TextPatternRangeEndpoint]::End, $caret, [Windows.Automation.Text.TextPatternRangeEndpoint]::Start)
-        [void]$caret.Move([Windows.Automation.Text.TextUnit]::Character, $Offset)
+        # Why: UIA moves by insertion positions, which count a surrogate pair or a CRLF once.
+        $positions = 0
+        for ($i = 0; $i -lt $Leading.Length; $i++) {
+            if ([char]::IsHighSurrogate($Leading[$i]) -or ($Leading[$i] -eq "`r" -and $i + 1 -lt $Leading.Length -and $Leading[$i + 1] -eq "`n")) { $i++ }
+            $positions++
+        }
+        $start = [Windows.Automation.Text.TextPatternRangeEndpoint]::Start
+        $end = [Windows.Automation.Text.TextPatternRangeEndpoint]::End
+        $caret = $Element.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern).DocumentRange.Clone()
+        $caret.MoveEndpointByRange($end, $caret, $start)
+        [void]$caret.MoveEndpointByUnit($end, [Windows.Automation.Text.TextUnit]::Character, $positions)
+        $caret.MoveEndpointByRange($start, $caret, $end)
         $caret.Select()
     } catch {}
 }
@@ -828,6 +840,8 @@ function Get-OrcaTextSelectionOffsets($Element) {
 }
 
 function Invoke-OrcaValueTextInsertion($Element, [int]$Index, [string]$Text) {
+    # Why: Chromium applies a value write as replaced inner text, which editors with their own model miss or revert.
+    if ((Get-OrcaProperty $Element "FrameworkId") -eq "Chrome") { return $null }
     $pattern = try { $Element.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern) } catch { $null }
     if ($null -eq $pattern) { return $null }
     if ($pattern.Current.IsReadOnly) { throw "element $Index text is not settable: the field is read-only" }
@@ -847,7 +861,7 @@ function Invoke-OrcaValueTextInsertion($Element, [int]$Index, [string]$Text) {
         if ($actual -ceq $next -or $stopwatch.ElapsedMilliseconds -ge 500) { break }
         Start-Sleep -Milliseconds 25
     }
-    if ($actual -ceq $next) { Set-OrcaTextCaret $Element ($selection[0] + $Text.Length) }
+    if ($actual -ceq $next) { Set-OrcaTextCaret $Element ($current.Substring(0, $selection[0]) + $Text) }
     $verification = if ($actual -ceq $next) {
         [pscustomobject]@{ state = "verified"; property = "elementText" }
     } elseif ($null -eq $actual) {
@@ -1032,7 +1046,7 @@ function New-OrcaElementRecord($Element, [int]$Index, $WindowFrame) {
         $value = Get-OrcaRangeValueText $Element
     }
     if ([string]::IsNullOrEmpty($value) -and $nativeWindowHandle -ne 0 -and (Test-OrcaEditClass $className)) {
-        $value = Get-OrcaEditValueText $Element ([IntPtr]$nativeWindowHandle)
+        $value = Get-OrcaEditValueText ([IntPtr]$nativeWindowHandle)
     }
     [pscustomobject]@{
         index = $Index
